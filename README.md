@@ -1,5 +1,5 @@
 # BART
-An simple tool to finetune BART.
+A simple tool to finetune BART.
 
 #### Environment
 ```bash
