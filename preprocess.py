@@ -210,6 +210,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_source_length", type=int, default=128)
     parser.add_argument("--max_target_length", type=int, default=32)
     parser.add_argument("--multi_turn", type=int, default=-1)
+    parser.add_argument("--only_test", type=int, default=-1)
     parser.add_argument("--encoder_model_name_or_path", type=str)
 
     parser.add_argument("--dataset_type",

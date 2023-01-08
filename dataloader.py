@@ -107,8 +107,10 @@ class NLIDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.pre['input_ids'])
 
+import itertools
 
-def read_convai2_split(split_dir, multi_turn=-1):
+def read_convai2_split(split_dir, multi_turn=-1, permutaion_id=-1):
+    permutations = list(itertools.permutations([0,1,2,3,4]))
     persona = []
     query = []
     response = []
@@ -124,16 +126,20 @@ def read_convai2_split(split_dir, multi_turn=-1):
                 else:
                     st = 'dia'
 
-                if pre_st == 'dia' and st == 'per': # a new session
-                    per_group = ''
+                if pre_st == 'dia' and st == 'per': # start a new session
+                    per_group = []
                     history = ''
+                    flag = True # whether to shuffle persona
 
                 if st == 'per':
-                    per_group+=(line[16:] + ' ')
-                    # per_group+=(line[16:]+'\t')
-
+                    per_group.append(line[16:].strip())
                 elif st == 'dia':
-                    persona.append(per_group)
+                    if permutaion_id != -1 and flag: # -1 for normal order
+                        permutation = permutations[permutaion_id]
+                        n_persona = [per_group[i] for i in permutation if i < len(per_group)]
+                        per_group = n_persona
+                        flag = False
+                    persona.append(' '.join(per_group))
                     line = line[line.find(' '):]
                     cur_query, cur_response = line.split('\t')[0].strip(), line.split('\t')[1].strip()
 
