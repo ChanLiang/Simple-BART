@@ -1,7 +1,7 @@
  time=`date '+%F-%H:%M:%S'`
  exp_name=bart_base_baseline
 
- CUDA_VISIBLE_DEVICES=1 python encoder-decoder.py \
+ CUDA_VISIBLE_DEVICES=1 python bart.py \
  --do_train \
  --dataset_type convai2 \
  --dumped_token ./data/ConvAI2/convai2_tokenized/ \

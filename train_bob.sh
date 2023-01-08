@@ -1,4 +1,4 @@
- CUDA_VISIBLE_DEVICES=1 python bertoverbert.py --do_train \
+ CUDA_VISIBLE_DEVICES=1 python bob.py --do_train \
  --encoder_model ../bert-base-models \
  --decoder_model ../bert-base-models \
  --decoder2_model ../bert-base-models \
