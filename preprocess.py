@@ -30,9 +30,13 @@ from dataloader import read_nli_split
 
 def preprocess(args):
     print(f"Reading {args.dataset_type} dataset...")
-    train_persona, train_query, train_response = read_convai2_split(args.trainset) if args.dataset_type=='convai2' else read_ecdt2019_split(args.trainset)
-    val_persona, val_query, val_response = read_convai2_split(args.validset) if args.dataset_type=='convai2' else read_ecdt2019_split(args.validset, split_type='val')
-    test_persona, test_query, test_response = read_convai2_split(args.testset) if args.dataset_type=='convai2' else read_ecdt2019_split(args.testset, split_type='test')
+    if args.multi_turn == -1:
+        print ('single turn...')
+    else:
+        print ('multi-turn...')
+    train_persona, train_query, train_response = read_convai2_split(args.trainset, multi_turn=args.multi_turn) if args.dataset_type=='convai2' else read_ecdt2019_split(args.trainset)
+    val_persona, val_query, val_response = read_convai2_split(args.validset, multi_turn=args.multi_turn) if args.dataset_type=='convai2' else read_ecdt2019_split(args.validset, split_type='val')
+    test_persona, test_query, test_response = read_convai2_split(args.testset, multi_turn=args.multi_turn) if args.dataset_type=='convai2' else read_ecdt2019_split(args.testset, split_type='test')
 
     assert len(train_persona) == len(train_query) == len(train_response)
     assert len(val_persona) == len(val_query) == len(val_response)
@@ -126,6 +130,8 @@ def preprocess(args):
         
     if args.dataset_type=='convai2':
         path = './data/ConvAI2/convai2_tokenized/' 
+        if args.multi_turn != -1:
+            path = './data/ConvAI2/convai2_tokenized_multi_turn_segtoken/'
     else:
         path = './data/ECDT2019/ecdt2019_tokenized/'
     
@@ -203,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_valid_split", type=float, default=0.1)
     parser.add_argument("--max_source_length", type=int, default=128)
     parser.add_argument("--max_target_length", type=int, default=32)
+    parser.add_argument("--multi_turn", type=int, default=-1)
     parser.add_argument("--encoder_model_name_or_path", type=str)
 
     parser.add_argument("--dataset_type",

@@ -108,9 +108,7 @@ class NLIDataset(torch.utils.data.Dataset):
         return len(self.pre['input_ids'])
 
 
-
-
-def read_convai2_split(split_dir):
+def read_convai2_split(split_dir, multi_turn=-1):
     persona = []
     query = []
     response = []
@@ -120,28 +118,36 @@ def read_convai2_split(split_dir):
             for line in src:
                 line = line.strip()
                 
+                pre_st = st
                 if 'your persona:' in line:
-                    pre_st = st
                     st = 'per'
                 else:
-                    pre_st = st
                     st = 'dia'
 
-                if pre_st == 'dia' and st == 'per':
+                if pre_st == 'dia' and st == 'per': # a new session
                     per_group = ''
+                    history = ''
 
                 if st == 'per':
-                    per_group+=(line[16:]+' ')
+                    per_group+=(line[16:] + ' ')
                     # per_group+=(line[16:]+'\t')
+
                 elif st == 'dia':
                     persona.append(per_group)
                     line = line[line.find(' '):]
-                    query.append(line.split('\t')[0])
-                    response.append(line.split('\t')[1])
+                    cur_query, cur_response = line.split('\t')[0].strip(), line.split('\t')[1].strip()
+
+                    final_query = cur_query if multi_turn == -1 else history + 'speaker 1: ' + cur_query
+                    final_response = cur_response if multi_turn == -1 else 'speaker 2: ' + cur_response
+
+                    query.append(final_query)
+                    response.append(final_response)
+                    history = 'speaker 1: ' + cur_query + ' speaker 2: ' + cur_response + ' '
                 else:
                     raise (ValueError)
     except FileNotFoundError:
         print(f"Sorry! The file {split_dir} can't be found.")
+
     return persona, query, response
 
 

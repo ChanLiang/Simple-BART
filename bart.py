@@ -22,23 +22,24 @@ import json
 from argparse import ArgumentParser
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-
-from xlibs import AdamW
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
 import math
+import sys
 
-from xlibs import BartForConditionalGeneration
-from xlibs import BartTokenizer
+# from transformers.optimization import AdamW, get_linear_schedule_with_warmup
+from transformers.optimization import get_linear_schedule_with_warmup
+from torch.optim import AdamW
+
+from transformers import BartForConditionalGeneration, BartTokenizer
 
 from dataloader import ConvAI2Dataset
 from dataloader import ECDT2019Dataset
-from dataloader import NLIDataset
 from evaluations import eval_distinct
+
+torch.manual_seed(42)
 
 CUDA_AVAILABLE = False
 if torch.cuda.is_available():
     CUDA_AVAILABLE = True
-    print("CUDA IS AVAILABLE")
 else:
     print("CUDA NOT AVAILABLE")
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -120,7 +121,6 @@ def train(args):
     print (model)
     print ('the number of trainable parameters: ', str(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
-    print("Load tokenized data...\n")
     tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
 
     # Tokenize & Batchify
@@ -154,7 +154,7 @@ def train(args):
             print(f"Sorry! The files in {args.dumped_token} can't be found.")
             raise ValueError
 
-    tokenizer, model = set_tokenier_and_model(tokenizer, model)
+    # tokenizer, model = set_tokenier_and_model(tokenizer, model)
 
     train_dataset = ConvAI2Dataset(train_persona_tokenized,
                                    train_query_tokenized,
@@ -182,7 +182,7 @@ def train(args):
     # optim_warmup = AdamW(model.parameters(), lr=args.warm_up_learning_rate)
     # optim = AdamW(model.parameters(), lr=args.learning_rate)
     args.total_optim_steps = (len(train_dataset) // args.batch_size) * args.total_epochs
-    print ('total_optim_steps = ', args.total_optim_steps)
+    print ('train_dataset, bz, total_optim_steps = ', len(train_dataset), args.batch_size, args.total_optim_steps)
     optim = AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = get_linear_schedule_with_warmup(optim, num_warmup_steps=args.warm_up_steps, num_training_steps=args.total_optim_steps)
     optim.zero_grad()
@@ -198,7 +198,6 @@ def train(args):
             step += 1
             # optim_warmup.zero_grad()
             optim.zero_grad()
-
 
             input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, lables, query_input_ids, persona_input_ids = prepare_data_batch(
                 batch)
@@ -226,11 +225,10 @@ def train(args):
                     print(f"train step {step}\tlr: {lr}\tloss: {loss_prt}\tppl: {ppl_prt}")
 
             loss.backward()
-            scheduler.step()
             optim.step()
+            scheduler.step()
 
-
-            if step % args.print_frequency == 0 and not step <= args.warm_up_steps and not args.print_frequency == -1:
+            if step == 1 or step % args.print_frequency == 0 and not args.print_frequency == -1:
                 print('Sampling (not final results) ...')
                 model.eval()
                 for val_batch in val_loader:
@@ -239,8 +237,7 @@ def train(args):
                         val_batch)
 
                     generated = model.generate(input_ids,
-                                               attention_mask=attention_mask,
-                                               per_input_ids=persona_input_ids)
+                                               attention_mask=attention_mask)
                     
                     generated_token = tokenizer.batch_decode(
                         generated, skip_special_tokens=True)[-5:]
@@ -254,20 +251,68 @@ def train(args):
                         persona_input_ids, skip_special_tokens=True)[-5:]
 
                     if rd.random() < 0.6:
-                        for p, q, g, j, k in zip(persona_token, query_token, gold_token, generated_token):
+                        for p, q, g, j in zip(persona_token, query_token, gold_token, generated_token):
                             print(
-                                f"persona: {p[:150]}\nquery: {q[:100]}\ngold: {g[:100]}\nresponse from D1: {j[:100]}\n")
+                                f"persona: {p[:150]}\nquery: {q[:100]}\ngold: {g[:100]}\npredict response: {j[:100]}\n")
                         break
                 print('\nTRAINING EPOCH %d\n' % epoch)
                 model.train()
 
+
+            if step == 1 or step % args.valid_frequency == 0:
+                print('validing ppl ...')
+                model.eval()
+                loss_1 = []
+                ntokens = []
+                n_samples = 0
+                for ppl_batch in val_loader:
+                    input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, lables, query_input_ids, persona_input_ids = prepare_data_batch(ppl_batch)
+
+                    with torch.no_grad():
+                        outputs_1 = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            decoder_input_ids=decoder_input_ids,
+                            decoder_attention_mask=decoder_attention_mask,
+                            labels=lables,
+                            return_dict=True,
+                            )
+
+                    if args.ppl_type == 'tokens':
+                        trg_len = decoder_attention_mask.sum()
+                        log_likelihood_1 = outputs_1.loss * trg_len
+                        ntokens.append(trg_len)
+                        loss_1.append(log_likelihood_1)
+
+                    elif args.ppl_type == 'sents':
+                        n_samples += 1
+                        loss_1.append(torch.exp(outputs_1.loss))
+                        # print ('loss, ppl = ', outputs_1.loss, torch.exp(outputs_1.loss))
+                    else:
+                        print(f"Invalid ppl type {args.ppl_type}")
+                        raise (ValueError)
+
+                if args.ppl_type == 'tokens':
+                    ppl_1 = torch.exp(torch.stack(loss_1).sum() / torch.stack(ntokens).sum())
+                elif args.ppl_type == 'sents':
+                    ppl_1 = torch.stack(loss_1).sum() / n_samples
+                else:
+                    raise (ValueError)
+
+                print(f"Perplexity on valid set is {round(float(ppl_1.cpu().numpy()),3)} ."
+                    ) if CUDA_AVAILABLE else (
+                    f"Perplexity on valid set is {round(float(ppl_1.numpy()),3)} .")
+
+                model.train()
+
+            sys.stdout.flush()
+
         if not step <= args.warm_up_steps:
             print(f'Saving model at epoch {epoch} step {step}')
-            model.save_pretrained(f"{args.save_model_path}_%d" % epoch)
+            model.save_pretrained(f"{args.save_model_path}/ckp_%d" % epoch)
 
 
 def predict(args):
-    print("Load tokenized data...\n")
     tokenizer = BartTokenizer.from_pretrained(args.encoder_model)
 
     if args.dumped_token is None:
@@ -276,19 +321,15 @@ def predict(args):
     else:
         path = args.dumped_token
         try:
-            print(f"Load tokenized dataset from {args.dumped_token}.")
-
+            # print(f"Load tokenized dataset from {args.dumped_token}.")
             # Loading testset
             with open(path + 'test_persona.json') as test_persona:
-                print("Load test_persona")
                 tmp = test_persona.readline()
                 test_persona_tokenized = json.loads(tmp)
             with open(path + 'test_query.json') as test_query:
-                print("Load test_query")
                 tmp = test_query.readline()
                 test_query_tokenized = json.loads(tmp)
             with open(path + 'test_response.json') as test_response:
-                print("Load test_response")
                 tmp = test_response.readline()
                 test_response_tokenized = json.loads(tmp)
 
@@ -302,37 +343,64 @@ def predict(args):
                                   device) if args.dataset_type == 'convai2' else ECDT2019Dataset(test_persona_tokenized,
                                                                                                  test_query_tokenized,
                                                                                                  test_response_tokenized,                                                                                             device)
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.infer_batch_size, shuffle=False)
 
     # Loading Model
     if args.dataset_type == 'convai2':
-        model_path = f"./checkpoints/ConvAI2/bertoverbert_{args.eval_epoch}"
-        # model_path = f"./checkpoints/ConvAI2_lex/bertoverbert_{args.eval_epoch}"
+        model_path = f"./checkpoints/ConvAI2/bart/{args.exp_name}/ckp_{args.eval_epoch}"
     elif args.dataset_type == 'ecdt2019':
-        model_path = f"./checkpoints/ECDT2019/bertoverbert_ecdt_{args.eval_epoch}"
+        model_path = f"./checkpoints/ECDT2019/bart_ecdt_{args.eval_epoch}"
     else:
         print(f"Invalid dataset_type {args.dataset_type}")
         raise (ValueError)
-    print("Loading Model from %s" % model_path)
+    # print("Loading Model from %s" % model_path)
+
+    # from transformers import BartForConditionalGeneration
     model = BartForConditionalGeneration.from_pretrained(model_path)
     model.to(device)
     model.eval()
 
-    tokenizer, model = set_tokenier_and_model(tokenizer, model)
+    # tokenizer, model = set_tokenier_and_model(tokenizer, model)
 
-    print(f"Writing generated results to {args.save_result_path}...")
+    # print(f"Writing generated results to {args.save_result_path}...")
 
-    with open(args.save_result_path, "w", encoding="utf-8") as outf:
+    with open(args.save_result_path + '_human_view', "w", encoding="utf-8") as outf, \
+        open(args.save_result_path + '_pred_response', "w", encoding="utf-8") as outfr:
         for test_batch in tqdm(test_loader):
             input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, lables, query_input_ids, persona_input_ids = prepare_data_batch(
                 test_batch)
 
-            generated = model.generate(input_ids,
-                                       attention_mask=attention_mask,
-                                       num_beams=args.beam_size,
-                                       length_penalty=args.length_penalty,
-                                       min_length=args.min_length,
-                                       no_repeat_ngram_size=args.no_repeat_ngram_size)
+            # 1. beam search
+            # generated = model.generate(input_ids,
+            #                            attention_mask=attention_mask,
+            #                            num_beams=args.beam_size,
+            #                            length_penalty=args.length_penalty,
+            #                            min_length=args.min_length)
+
+            # 2. sampling
+            # generated = model.generate(input_ids, 
+            #     attention_mask=attention_mask,
+            #     top_k=10,
+            #     top_p=0.9,
+            #     do_sample=True,
+            #     temperature=0.8
+            # )
+
+            # generated = model.generate(input_ids, 
+            #     attention_mask=attention_mask,
+            #     max_new_tokens=40,
+            #     top_k=50,
+            #     top_p=0.9,
+            #     do_sample=True,
+            #     temperature=1.2
+            # )
+
+            # 3. greedy
+            generated = model.generate(input_ids, 
+                attention_mask=attention_mask,
+                max_new_tokens=40,
+            )
+
             # print ('generated')
             # print (generated)
 
@@ -352,13 +420,18 @@ def predict(args):
                 persona_input_ids, skip_special_tokens=True)
 
             
-            for p, q, g, r, r2 in zip(persona_token, query_token, gold_token, generated_token):
+            for p, q, g, r in zip(persona_token, query_token, gold_token, generated_token):
+                while r[0] in ['.', '!', ',']:
+                    r = r[1:]
+                if r.startswith('esome'):
+                    r = 'aw' + r
+                if r.startswith('ounds'):
+                    r = 's' + r
                 outf.write(f"persona:{p}\tquery:{q}\tgold:{g}\tresponse_from_d1:{r}\n")
-
+                outfr.write(r.strip() + '\n')
 
 def evaluation(args):
-    print("Load tokenized data...\n")
-    tokenizer = BartForConditionalGeneration.from_pretrained(args.encoder_model)
+    tokenizer = BartTokenizer.from_pretrained(args.encoder_model)
 
     if args.dumped_token is None:
         print('Pre-tokenized files must be provided.')
@@ -366,17 +439,14 @@ def evaluation(args):
     else:
         path = args.dumped_token
         try:
-            print(f"Load tokenized dataset from {args.dumped_token}.")
+            # print(f"Load tokenized dataset from {args.dumped_token}.")
             with open(path + 'test_persona.json') as test_persona:
-                print("Load test_persona")
                 tmp = test_persona.readline()
                 test_persona_tokenized = json.loads(tmp)
             with open(path + 'test_query.json') as test_query:
-                print("Load test_query")
                 tmp = test_query.readline()
                 test_query_tokenized = json.loads(tmp)
             with open(path + 'test_response.json') as test_response:
-                print("Load test_response")
                 tmp = test_response.readline()
                 test_response_tokenized = json.loads(tmp)
 
@@ -395,22 +465,22 @@ def evaluation(args):
 
     # Loading Model
     if args.dataset_type == 'convai2':
-        # model_path = f"./checkpoints/ConvAI2/bertoverbert_{args.eval_epoch}"
-        model_path = f"./checkpoints/ConvAI2_lex/bertoverbert_{args.eval_epoch}"
-
+        # model_path = f"./checkpoints/ConvAI2/bart_{args.eval_epoch}"
+        model_path = f"./checkpoints/ConvAI2/bart/{args.exp_name}/ckp_{args.eval_epoch}"
     elif args.dataset_type == 'ecdt2019':
-        model_path = f"./checkpoints/ECDT2019/bertoverbert_ecdt_{args.eval_epoch}"
+        model_path = f"./checkpoints/ECDT2019/bart_ecdt_{args.eval_epoch}"
     else:
         print(f"Invalid dataset_type {args.dataset_type}")
         raise (ValueError)
 
-    print("Loading Model from %s" % model_path)
+    # print("Loading Model from %s" % model_path)
+    # from transformers import BartForConditionalGeneration
     model = BartForConditionalGeneration.from_pretrained(model_path)
-    tokenizer, model = set_tokenier_and_model(tokenizer, model)
+    # tokenizer, model = set_tokenier_and_model(tokenizer, model)
     model.to(device)
     model.eval()
 
-    print('Evaluate perplexity...')
+    # print('Evaluate perplexity...')
     loss_1 = []
     ntokens = []
     n_samples = 0
@@ -436,6 +506,7 @@ def evaluation(args):
         elif args.ppl_type == 'sents':
             n_samples += 1
             loss_1.append(torch.exp(outputs_1.loss))
+            # print ('loss, ppl = ', outputs_1.loss, torch.exp(outputs_1.loss))
         else:
             print(f"Invalid ppl type {args.ppl_type}")
             raise (ValueError)
@@ -451,39 +522,39 @@ def evaluation(args):
           ) if CUDA_AVAILABLE else (
         f"Perplexity on test set is {round(float(ppl_1.numpy()),3)} .")
 
-    if args.word_stat:
-        print('Generating...')
-        generated_token = []
-        generated2_token = []
-        gold_token = []
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-        with open('evaluations/hyp.txt', 'w') as hyp, open('evaluations/hyp2.txt', 'w') as hyp2, open(
-                'evaluations/ref.txt', 'w') as ref:
-            for test_batch in tqdm(test_loader):
-                input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, lables, query_input_ids, persona_input_ids = prepare_data_batch(
-                    test_batch)
-                generated = model.generate(input_ids,
-                                           attention_mask=attention_mask,
-                                           num_beams=args.beam_size,
-                                           length_penalty=args.length_penalty,
-                                           min_length=args.min_length,
-                                           no_repeat_ngram_size=args.no_repeat_ngram_size)
-                                        #    per_input_ids=persona_input_ids)
+    # if args.word_stat:
+    #     print('Generating...')
+    #     generated_token = []
+    #     generated2_token = []
+    #     gold_token = []
+    #     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    #     with open('evaluations/hyp.txt', 'w') as hyp, open('evaluations/hyp2.txt', 'w') as hyp2, open(
+    #             'evaluations/ref.txt', 'w') as ref:
+    #         for test_batch in tqdm(test_loader):
+    #             input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, lables, query_input_ids, persona_input_ids = prepare_data_batch(
+    #                 test_batch)
+    #             generated = model.generate(input_ids,
+    #                                        attention_mask=attention_mask,
+    #                                        num_beams=args.beam_size,
+    #                                        length_penalty=args.length_penalty,
+    #                                        min_length=args.min_length)
+    #                                     #    no_repeat_ngram_size=args.no_repeat_ngram_size)
+    #                                     #    per_input_ids=persona_input_ids)
 
                 
-                generated_token += tokenizer.batch_decode(generated,
-                                                          skip_special_tokens=True)
+    #             generated_token += tokenizer.batch_decode(generated,
+    #                                                       skip_special_tokens=True)
                
-                gold_token += tokenizer.batch_decode(decoder_input_ids,
-                                                     skip_special_tokens=True)
-            for g, r in zip(gold_token, generated_token):
-                ref.write(f"{g}\n")
-                hyp.write(f"{r}\n")
+    #             gold_token += tokenizer.batch_decode(decoder_input_ids,
+    #                                                  skip_special_tokens=True)
+    #         for g, r in zip(gold_token, generated_token):
+    #             ref.write(f"{g}\n")
+    #             hyp.write(f"{r}\n")
 
-        hyp_d1, hyp_d2 = eval_distinct(generated_token)
-        ref_d1, ref_d2 = eval_distinct(gold_token)
-        print(f"Distinct-1 (hypothesis, reference): {round(hyp_d1,4)}, {round(ref_d1,4)}")
-        print(f"Distinct-2 (hypothesis, reference): {round(hyp_d2,4)}, {round(ref_d2,4)}")
+    #     hyp_d1, hyp_d2 = eval_distinct(generated_token)
+    #     ref_d1, ref_d2 = eval_distinct(gold_token)
+    #     print(f"Distinct-1 (hypothesis, reference): {round(hyp_d1,4)}, {round(ref_d1,4)}")
+    #     print(f"Distinct-2 (hypothesis, reference): {round(hyp_d2,4)}, {round(ref_d2,4)}")
 
 
 
@@ -493,14 +564,13 @@ if __name__ == "__main__":
     parser.add_argument("--do_predict", action="store_true")
     parser.add_argument("--do_evaluation", action="store_true")
     parser.add_argument("--word_stat", action="store_true")
-    parser.add_argument("--use_decoder2", action="store_true") # 区分两次decode；
 
     parser.add_argument("--train_valid_split", type=float, default=0.1)
 
     parser.add_argument(
         "--encoder_model",
         type=str,
-        default="./pretrained_models/bert/bert-base-uncased/")
+        default="facebook/bart-base")
     parser.add_argument(
         "--decoder_model",
         type=str,
@@ -514,11 +584,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--total_epochs", type=int, default=10)
     parser.add_argument("--eval_epoch", type=int, default=7)
-    parser.add_argument("--print_frequency", type=int, default=-1)
+    parser.add_argument("--print_frequency", type=int, default=500)
+    parser.add_argument("--valid_frequency", type=int, default=500)
     parser.add_argument("--warm_up_steps", type=int, default=1000)
 
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--beam_size", type=int, default=1)
+    parser.add_argument("--infer_batch_size", type=int, default=128)
+    parser.add_argument("--beam_size", type=int, default=5)
     parser.add_argument("--min_length", type=int, default=3)
     parser.add_argument("--no_repeat_ngram_size", type=int, default=0)
     parser.add_argument("--length_penalty", type=float, default=1.0)
@@ -526,7 +598,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--save_model_path",
                         type=str,
-                        default="checkpoints/bertoverbert")
+                        default="checkpoints/bart")
     parser.add_argument("--save_result_path",
                         type=str,
                         default="test_result.tsv")
@@ -538,6 +610,9 @@ if __name__ == "__main__":
                         default='sents')  # sents, tokens
 
     parser.add_argument("--local_rank", type=int, default=0)
+
+    parser.add_argument("--exp_name", type=str, default="bart_base_baseline")
+
     
     '''
     dumped_token
@@ -552,8 +627,10 @@ if __name__ == "__main__":
 
     if args.do_train:
         train(args)
-    if args.do_predict:
-        predict(args)
+
+    # if args.do_predict:
+    #     predict(args)
+
     if args.do_evaluation:
         evaluation(args)
 
