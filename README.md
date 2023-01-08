@@ -2,7 +2,11 @@
 A simple tool to finetune BART (on Persona-Chat dataset).
 
 #### Environment
+The `setup.sh` script contains the necessary dependencies to run this project. 
+
+Simply run `./setup.sh` would install these dependencies. 
 ```bash
+./set_up.sh
 source env.sh
 ```
 
