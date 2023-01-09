@@ -15,7 +15,10 @@
 # -*- coding: utf-8 -*-
 
 import torch
+import random
 import json
+import itertools
+
 
 '''
 DATASETS
@@ -107,9 +110,23 @@ class NLIDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.pre['input_ids'])
 
-import itertools
 
-def read_convai2_split(split_dir, multi_turn=-1, permutaion_id=-1):
+class WrapperDataset(torch.utils.data.Dataset):
+    def __init__(self, datasetA, datasetB):
+        assert len(datasetA) == len(datasetB)
+        self.datasetA = datasetA
+        self.datasetB = datasetB
+        
+    def __getitem__(self, index):
+        xA = self.datasetA[index]
+        xB = self.datasetB[index]
+        return xA, xB
+    
+    def __len__(self):
+        return len(self.datasetA)
+
+
+def read_convai2_split(split_dir, multi_turn=-1, permutaion_id=-1, shuffle=-1):
     permutations = list(itertools.permutations([0,1,2,3,4]))
     persona = []
     query = []
@@ -139,6 +156,10 @@ def read_convai2_split(split_dir, multi_turn=-1, permutaion_id=-1):
                         n_persona = [per_group[i] for i in permutation if i < len(per_group)]
                         per_group = n_persona
                         flag = False
+                        
+                    if shuffle != -1:
+                        random.shuffle(per_group) # for every single example
+
                     persona.append(' '.join(per_group))
                     line = line[line.find(' '):]
                     cur_query, cur_response = line.split('\t')[0].strip(), line.split('\t')[1].strip()
