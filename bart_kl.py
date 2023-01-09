@@ -21,7 +21,7 @@ import json
 
 from argparse import ArgumentParser
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler, RandomSampler
 import math
 import sys
 
@@ -154,6 +154,7 @@ def train(args):
 
 
         wrapper_train_dataset = WrapperDataset(train_dataset, shuffle_train_dataset)
+        print (len(train_dataset), len(shuffle_train_dataset), len(wrapper_train_dataset), args.batch_size)
 
         train_loader = DataLoader(wrapper_train_dataset,
                                 batch_size=args.batch_size,
@@ -162,7 +163,7 @@ def train(args):
         val_loader = DataLoader(val_dataset,
                                 batch_size=args.batch_size,
                                 shuffle=True)
-
+        
         return train_loader, val_loader, train_dataset
 
     train_loader, val_loader, train_dataset = get_data_loader(path, shuffle_path)
@@ -202,8 +203,6 @@ def train(args):
             decoder_attention_mask = torch.cat([decoder_attention_mask1, decoder_attention_mask2], dim=0)
             labels = torch.cat([lables1, lables2], dim=0)
 
-            assert input_ids.size(0) == args.batch_size * 2, (input_ids.shape, args.batch_size)
-
             # regularize response:
             kl_mask = decoder_attention_mask.eq(0) # （0无效，1有效）
 
@@ -217,31 +216,34 @@ def train(args):
                             kl_mask=kl_mask,
                             split_loss=args.split_loss)
 
-            loss = outputs.loss[0]
+
+            lm_loss = outputs.loss[0]
             kl_loss = outputs.loss[1]
+            loss = lm_loss + (args.alpha / args.total_optim_steps) * kl_loss
 
             ppl = math.exp(loss.item())
 
-            loss_prt = loss.cpu().detach().numpy() if CUDA_AVAILABLE else loss.detach().numpy()
-            loss_prt = round(float(loss_prt),3)
+            lm_loss_prt = lm_loss.cpu().detach().numpy() if CUDA_AVAILABLE else lm_loss.detach().numpy()
+            lm_loss_prt = round(float(lm_loss_prt),3)
             kl_loss_prt = kl_loss.cpu().detach().numpy() if CUDA_AVAILABLE else kl_loss.detach().numpy()
             kl_loss_prt = round(float(kl_loss_prt),3)
+            loss_prt = loss.cpu().detach().numpy() if CUDA_AVAILABLE else loss.detach().numpy()
+            loss_prt = round(float(loss_prt),3)
             ppl_prt = round(float(ppl),4)
             lr = optim.param_groups[0]['lr']
 
             if step <= args.warm_up_steps:
-                if step % 100 == 0:
-                    print(f"warm up step {step}\tlr: {lr}\tloss: {loss_prt}\tkl_loss: {kl_loss_prt}\tppl: {ppl_prt}")
+                if step % args.log_step == 0:
+                    print(f"warm up step {step}  lr: {lr}  loss: {loss_prt}  kl_loss: {kl_loss_prt}  lm_loss: {lm_loss_prt}  ppl: {ppl_prt}")
             else:
-                if step % 100 == 0:
-                    print(f"train step {step}\tlr: {lr}\tloss: {loss_prt}\tkl_loss: {kl_loss_prt}\tppl: {ppl_prt}")
-
-            loss = loss + (args.alpha / args.total_optim_steps) * kl_loss
+                if step % args.log_step == 0:
+                    print(f"train step {step}  lr: {lr}  loss: {loss_prt}  kl_loss: {kl_loss_prt}  lm_loss: {lm_loss_prt}  ppl: {ppl_prt}")
+            
             loss.backward()
             optim.step()
             scheduler.step()
 
-            if step == 1 or step % args.print_frequency == 0 and not args.print_frequency == -1:
+            if step % args.print_frequency == 0 and not args.print_frequency == -1:
                 print('Sampling (not final results) ...')
                 model.eval()
                 for val_batch in val_loader:
@@ -567,6 +569,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_epoch", type=int, default=7)
     parser.add_argument("--print_frequency", type=int, default=800)
     parser.add_argument("--valid_frequency", type=int, default=500)
+    parser.add_argument("--log_step", type=int, default=100)
     parser.add_argument("--warm_up_steps", type=int, default=1000)
 
     parser.add_argument("--batch_size", type=int, default=64)

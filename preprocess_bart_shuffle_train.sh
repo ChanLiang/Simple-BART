@@ -1,6 +1,7 @@
 
 # for((id=1;id<=10;id++))
-for((id=11;id<=20;id++))
+# for((id=11;id<=20;id++))
+for id in 2
 do
     echo $id
     python preprocess_shuffle_train.py \
