@@ -1335,6 +1335,8 @@ class BartForConditionalGeneration(BartPretrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         split_loss: Optional[bool] = None,
+        left_one: Optional[bool] = None,
+        fine_grain_kl: Optional[bool] = None,
         kl: Optional[bool] = None,
         kl_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, Seq2SeqLMOutput]:
@@ -1379,26 +1381,39 @@ class BartForConditionalGeneration(BartPretrainedModel):
         # 1. lm_loss
         masked_lm_loss = None
         small = -1
+        better_pos = None # for 1
         if labels is not None:
-            loss_fct = CrossEntropyLoss()
+            loss_fct = CrossEntropyLoss() if not fine_grain_kl else CrossEntropyLoss(reduction='none')
             # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_logits = lm_logits[..., :-1, :].contiguous() # seq_len - 1
+            shift_labels = labels[..., 1:].contiguous() # seq_len - 1
             if not split_loss:
-                # Flatten the tokens
+                ## Args: Flatten the tokens
+                #  logits: (bz x seq_len, |V|)
+                #  labels: (bz x seq_len)
+                #  N = bz x seq_len, C = |V|
+                ## Return: If `reduction` is 'none', then the same size as the target;
                 masked_lm_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             else:
                 shift_logits1, shift_logits2 = torch.split(shift_logits, shift_logits.size(0)//2, dim=0)
                 shift_labels1, shift_labels2 = torch.split(shift_labels, shift_labels.size(0)//2, dim=0)
                 masked_lm_loss1 = loss_fct(shift_logits1.view(-1, shift_logits1.size(-1)), shift_labels1.view(-1))
                 masked_lm_loss2 = loss_fct(shift_logits2.view(-1, shift_logits2.size(-1)), shift_labels2.view(-1))
-                small = 1 if masked_lm_loss1 < masked_lm_loss2 else 2
-                masked_lm_loss = (masked_lm_loss1 + masked_lm_loss2)/2
+                if not fine_grain_kl:
+                    small = 1 if masked_lm_loss1 < masked_lm_loss2 else 2
+                    masked_lm_loss = (masked_lm_loss1 + masked_lm_loss2)/2 if not left_one else masked_lm_loss1
+                else: # masked_lm_loss1 is (N)
+                    better_pos = torch.gt(masked_lm_loss1, masked_lm_loss2) # Computes input>other element-wise.
+                    masked_lm_loss = torch.mean(torch.cat([masked_lm_loss1, masked_lm_loss2], dim=0))
+            
 
         # 2. kl_loss
         kl_loss = None
         if kl:
-            kl_loss = self.compute_kl_loss(lm_logits, pad_mask=kl_mask, small=small)
+            if not left_one or (left_one and small == 2) or fine_grain_kl:
+                kl_loss = self.compute_kl_loss(lm_logits, pad_mask=kl_mask, small=small, better_pos=better_pos)
+            else:
+                kl_loss = torch.tensor(0.0, device=masked_lm_loss.device)
                 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]
@@ -1415,8 +1430,9 @@ class BartForConditionalGeneration(BartPretrainedModel):
             encoder_hidden_states=outputs.encoder_hidden_states,
             encoder_attentions=outputs.encoder_attentions,
         )
+
     
-    def compute_kl_loss(self, net_output, pad_mask=None, reduce=True, small=-1):
+    def compute_kl_loss(self, net_output, pad_mask=None, reduce=True, small=-1, better_pos=None):
         '''
         Args
         net_output: lm_logits
@@ -1424,6 +1440,10 @@ class BartForConditionalGeneration(BartPretrainedModel):
         Return
         kl_loss
         '''
+        if better_pos is not None:
+            net_output = net_output[..., :-1, :].contiguous()
+            pad_mask = pad_mask[..., :-1].contiguous()
+
         net_prob = torch.nn.functional.log_softmax(net_output, dim=-1)
         net_prob_tec =  torch.nn.functional.softmax(net_output, dim=-1)
 
@@ -1438,20 +1458,44 @@ class BartForConditionalGeneration(BartPretrainedModel):
             # print ('detach 2')
             q = q.detach()
             q_tec = q_tec.detach()
-        # else:
-        #     print ('no detach')
+
+        if better_pos is not None:
+            assert small == -1
+            assert better_pos.size(0) == p.size(0) * p.size(1), (better_pos.size(0), p.size(0), p.size(1))
+            p = p.reshape((better_pos.size(0), p.size(-1)))
+            q = q.reshape((better_pos.size(0), p.size(-1)))
+            p_tec = p_tec.reshape((better_pos.size(0), p.size(-1)))
+            q_tec = q_tec.reshape((better_pos.size(0), p.size(-1)))
+            pad_mask = pad_mask.reshape(better_pos.size(0) * 2)
+           
+            ## failed attempt
+            # p[better_pos].detach_()
+            # p_tec[better_pos].detach_()
+            # q[~better_pos].detach_()
+            # q_tec[~better_pos].detach_()
+            # print ('p = \n', p) # to check whether the require_grad is False
+            # print ('q = \n', q)
+
+            def zero_grad(grad, idx):
+                grad[idx] = 0 
+                return grad
+
+            p.register_hook(lambda grad: zero_grad(grad, better_pos))
+            p_tec.register_hook(lambda grad: zero_grad(grad, better_pos))
+            q.register_hook(lambda grad: zero_grad(grad, ~better_pos))
+            q_tec.register_hook(lambda grad: zero_grad(grad, ~better_pos))
 
         p_loss = torch.nn.functional.kl_div(p, q_tec, reduction='none')
         q_loss = torch.nn.functional.kl_div(q, p_tec, reduction='none')
 
-        # print (p_loss.shape, pad_mask.shape) # torch.Size([60, 50257]) torch.Size([32, 120])
+        # print (p_loss.shape, pad_mask.shape, better_pos.shape) # torch.Size([60, 50257]) torch.Size([32, 120])
         p_loss = torch.sum(p_loss, dim=-1)
         q_loss = torch.sum(q_loss, dim=-1)
         # print (p_loss.shape, pad_mask.shape) # torch.Size([60]) torch.Size([32, 120])
         if pad_mask is not None:
             pad_mask1, pad_mask2 = torch.split(pad_mask, pad_mask.size(0)//2, dim=0)
             p_loss.masked_fill_(pad_mask1, 0.) # Fills elements of self tensor with value where mask is True. 
-            q_loss.masked_fill_(pad_mask1, 0.)
+            q_loss.masked_fill_(pad_mask2, 0.)
 
         if reduce:
             p_loss = p_loss.sum()

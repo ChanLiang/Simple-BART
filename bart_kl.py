@@ -179,6 +179,7 @@ def train(args):
 
     print("\nStart Training...")
     step = 0
+    best_dev = 10000
     start_epoch = int(args.checkpoint.split("_")[-1]) if args.load_checkpoint else 0
     for epoch in range(start_epoch, args.total_epochs):
         print('\nTRAINING EPOCH %d' % epoch)
@@ -194,7 +195,7 @@ def train(args):
             input_ids2, attention_mask2, decoder_input_ids2, decoder_attention_mask2, lables2, query_input_ids2, persona_input_ids2 = prepare_data_batch(batch2)
             # context and response are the same
             assert torch.equal(query_input_ids1, query_input_ids2), (query_input_ids1.shape, query_input_ids2.shape)
-            assert torch.equal(decoder_input_ids1, decoder_input_ids2)
+            assert torch.equal(decoder_input_ids1, decoder_input_ids2), (decoder_input_ids1, decoder_input_ids2)
             assert torch.equal(lables1, lables2), (lables1[0], lables2[0])
 
             input_ids = torch.cat([input_ids1, input_ids2], dim=0)
@@ -214,14 +215,15 @@ def train(args):
                             return_dict=True,
                             kl=True,
                             kl_mask=kl_mask,
-                            split_loss=args.split_loss)
-
+                            split_loss=args.split_loss,
+                            left_one=args.left_one,
+                            fine_grain_kl=args.fine_grain_kl)
 
             lm_loss = outputs.loss[0]
             kl_loss = outputs.loss[1]
-            loss = lm_loss + (args.alpha / args.total_optim_steps) * kl_loss
+            loss = lm_loss + (args.alpha * step / args.total_optim_steps) * kl_loss
 
-            ppl = math.exp(loss.item())
+            ppl = math.exp(lm_loss.item())
 
             lm_loss_prt = lm_loss.cpu().detach().numpy() if CUDA_AVAILABLE else lm_loss.detach().numpy()
             lm_loss_prt = round(float(lm_loss_prt),3)
@@ -273,7 +275,6 @@ def train(args):
                 print('\nTRAINING EPOCH %d\n' % epoch)
                 model.train()
 
-
             if step == 1 or step % args.valid_frequency == 0:
                 # print('validing ppl ...')
                 model.eval()
@@ -318,6 +319,10 @@ def train(args):
                     ) if CUDA_AVAILABLE else (
                     f"Perplexity on valid set is {round(float(ppl_1.numpy()),3)} .")
 
+                if best_dev > float(ppl_1.cpu().numpy()):
+                    best_dev = float(ppl_1.cpu().numpy())
+                    if epoch > 1:
+                        model.save_pretrained(f"{args.save_model_path}/ckp_best")
                 model.train()
 
             sys.stdout.flush()
@@ -328,7 +333,7 @@ def train(args):
 
         # use a new shuffle data
         cur_shuffle_path = args.dumped_token_shuffle + str(epoch + 2) + '/'
-        train_loader, val_loader, train_dataset = get_data_loader(path, cur_shuffle_path)
+        train_loader, _, _ = get_data_loader(path, cur_shuffle_path)
 
 
 def predict(args):
@@ -476,10 +481,7 @@ def evaluation(args):
     test_dataset = ConvAI2Dataset(test_persona_tokenized,
                                   test_query_tokenized,
                                   test_response_tokenized,
-                                  device) if args.dataset_type == 'convai2' else ECDT2019Dataset(test_persona_tokenized,
-                                                                                                 test_query_tokenized,
-                                                                                                 test_response_tokenized,
-                                                                                                 device)
+                                  device)  
 
     ppl_test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
@@ -551,6 +553,8 @@ if __name__ == "__main__":
     
     parser.add_argument("--split_loss", action="store_true")
     parser.add_argument("--kl_loss", action="store_true")
+    parser.add_argument("--left_one", action="store_true")
+    parser.add_argument("--fine_grain_kl", action="store_true")
 
     parser.add_argument("--alpha", type=float, default=0.3)
 
